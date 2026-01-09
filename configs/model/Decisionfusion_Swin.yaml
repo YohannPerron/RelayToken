@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - _seg_default@model
+
+data:
+  factors_m: [4]
+  factors_px: [1]
+
+model:
+  net:
+    _target_: src.models.components.multiscaleDoubleNet.DoubleNet
+    num_classes: ${data.num_classes}
+    num_channels:
+      - ${data.num_channels}
+      - ${data.num_channels}
+    img_size: [256,256]
+
+    net_low_res_scale: 4
+
+    chkpt_net_high_res: null
+    chkpt_net_low_res: null
+
+    net_high_res:
+      _target_: src.models.components.Swin_v2.Swin_v2_module
+      pretrained: True
+      pretrained_path: ${paths.data_dir}/Models/swinv2_small_patch4_window8_256.pth
+
+      num_classes: ${data.num_classes}
+      num_channels: ${data.num_channels}
+      img_size: 256
+
+      patch_size: 4
+      window_size: 8
+      embed_dim: 96
+      depths: [2, 2, 18, 2]
+      num_heads: [3, 6, 12, 24]
+      segmentation_head:
+        _partial_: True
+        _target_: src.models.components.utils.SimpleSegmentationHead #src.models.components.utils.SimpleSegmentationHead
+        decoder_stride: 32
+      lora_rank: 0
+      use_FPN: False
+
+      num_register_tokens: 0
+
+    net_low_res: null # use sme model for both scale

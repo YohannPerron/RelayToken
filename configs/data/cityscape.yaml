@@ -1,0 +1,46 @@
+_target_: src.data.cityscape_datamodule.CityDataModule
+
+data_pth: ${paths.data_dir}cityscape/
+
+imageside: 256 # Value in original pixels of the side of the image
+imagesize: 256 # Size of the image in pixels
+
+mean: [0.485, 0.456, 0.406] #global mean of the whole dataset
+std: [58.4, 57.1, 57.4] #255*[0.229, 0.224, 0.225] #null for dataset norm or value
+mean_type: "global" #global, local, avg_pool or max_pool
+iinter: 1 #interpolation NEAREST = 0 LINEAR = 1 CUBIC = 3
+
+batch_size: 64
+pin_memory: True
+num_workers: ${num_workers}
+
+# Data Augmentation
+sample_multiplier: 1
+tsize_base: null # null for equal to image size dimension in meters
+# randomly multiply the size by a factor in the sizes
+tsize_enum_sizes: [1]
+tsize_enum_probs: [1]
+# randomly sample frac of the train sample with unform size in the range
+tsize_range_frac: 0.5
+tsize_range_sizes: [0.5, 2]
+#randomly rotate
+trot_prob: 0.5 #probability of rotation
+trot_angle: 90 #max angle (abs) of the rotation
+
+min_overlap: 1 # how much must be inside
+
+#How much overlap in % to use for test (some of both sides)
+val_overlap: 0.0
+test_overlap: 0.5
+
+#multiscale input image
+factors_m: null
+factors_px: null
+# context_statistic: ["avg"]
+
+# Info for the model
+num_channels: 3
+num_classes: 19
+index_to_ignore: 255 #index to ignore in the loss
+
+cache_dir: ${paths.cache_dir}

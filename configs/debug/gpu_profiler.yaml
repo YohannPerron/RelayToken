@@ -1,0 +1,23 @@
+# @package _global_
+
+# runs with execution time profiling
+
+trainer:
+  max_epochs: 1
+  profiler:
+    _target_: pytorch_lightning.profilers.PyTorchProfiler
+    schedule:
+      _target_: torch.profiler.schedule
+      wait: 10
+      warmup: 3
+      active: 3
+      repeat: 0
+    on_trace_ready:
+      _target_: torch.profiler.tensorboard_trace_handler
+      dir_name: "${paths.output_dir}/profiler_trace"
+    record_shapes: true
+    profile_memory: true
+    with_stack: true
+  limit_train_batches: 30
+  limit_val_batches: 30
+  limit_test_batches: 30

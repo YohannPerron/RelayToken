@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - RT_GLAM_S
+
+
+model:
+  net:
+    segmentation_head:
+      _partial_: True
+      _target_: src.models.components.utils.SimpleSegmentationHead #src.models.components.utils.SimpleSegmentationHead
+      decoder_stride: 32

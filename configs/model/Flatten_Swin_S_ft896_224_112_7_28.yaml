@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - _seg_default@model
+
+model:
+  net:
+    _target_: src.models.components.flatten_swin.Flatten_swin_module
+    pretrained: True
+    pretrained_path: ${paths.data_dir}/Models/flatten_ckpt_swin_s.pth
+
+    img_size: 896
+    patch_size: 4
+    window_size: 224
+    drop_path_rate: 0.1  # CAREFUL. Is it 0.1 or 0.3??
+    embed_dim: 96
+    depths: [2, 2, 18, 2]
+    num_heads: [3, 6, 12, 24]
+    segmentation_head:
+      _partial_: True
+      _target_: src.models.components.utils.SimpleSegmentationHead
+      decoder_stride: 32
+    num_register_tokens: 0
+    la:
+      attn_type: "LLSS"  
+      focusing_factor: 3
+      kernel_size: 5
+    swindow_sizes: [None, None, 7, 28]
+
+
+data:
+    imageside: 896
+    imagesize: 896

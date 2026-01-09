@@ -1,0 +1,26 @@
+defaults:
+  - _seg_default
+
+net:
+  _target_: src.models.components.glam.Glam
+  segmentation_head:
+    _target_: src.models.components.utils.seg_blocks.UPerHead
+    _partial_: True
+    pool_scales: [1, 2, 3, 6]
+  pretrained_encoder: True
+  pretrained_encoder_path: datasets/Models/swin_small_patch4_window7_224.ms_in22k.bin
+  embed_dim: 96
+  gt_num: 10 #number of global tokens
+  depths: [2, 2, 18, 2]
+  num_heads: [3, 6, 12, 24]
+  window_size: 7
+  mlp_ratio: 4
+  qkv_bias: True
+  qk_scale: null
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.3
+  ape: False
+  patch_norm: True
+  out_indices: [0, 1, 2, 3]
+  use_checkpoint: False

@@ -1,0 +1,12 @@
+# @package _global_
+
+# runs 1 train, 1 validation and 1 test step
+
+trainer:
+  fast_dev_run: true
+  limit_train_batches: 3
+  limit_val_batches: 3
+  limit_test_batches: 3
+
+model:
+  save_freq: 1

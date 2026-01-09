@@ -1,0 +1,17 @@
+defaults:
+  - _seg_default
+
+net:
+  _target_: src.models.components.xT.build.SegmentationXT
+  encoder_img_size: 256
+  img_size: ${data.imagesize}
+  patch_size: 16
+  mlp_ratio: 4
+  backbone_name: "swinv2_small_window16_256_timm"
+  decoder_name: "xT"
+  pretrained: false
+  pretrained_path: ""
+  segmentation_head:
+    _partial_: true
+    _target_: src.models.components.utils.seg_blocks.SimpleSegmentationHead
+

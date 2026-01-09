@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - RT_Swin2_S
+
+model:
+  net:
+    pretrained: True
+    pretrained_path: ${paths.data_dir}Models/swinv2_tiny_patch4_window8_256.pth
+
+    embed_dim: 96
+    depths: [2, 2, 6, 2]

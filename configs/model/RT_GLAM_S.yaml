@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - GLAM_S@model
+
+data:
+  factors_m: [4]
+  factors_px: [1]
+
+model:
+  net:
+    nb_register: 4
+    multi_scale: True
+    num_channels:
+      - ${data.num_channels}
+      - ${data.num_channels}
+    img_size: [256,256]
+  loss_context_factor: 0.1
+  loss_co_pred_factor: 0.1
+  loss_co_embed_factor: 0.0
+  context_factor_m: ${data.factors_m}
+  context_factor_px: ${data.factors_px}

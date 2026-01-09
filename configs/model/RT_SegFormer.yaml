@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - _seg_default@model
+
+data:
+  factors_m: [4]
+  factors_px: [1]
+
+model:
+  net:
+    _target_: src.models.components.Segformer.Segformer_module
+    num_classes: ${data.num_classes}
+    num_channels:
+      - ${data.num_channels}
+      - ${data.num_channels}
+    img_size: [256,256]
+    pretrained: True
+    pretrained_path: ${paths.data_dir}/Models/mit-b3.bin
+
+    #Using B3
+    dims: [64, 128, 320, 512]
+    heads: [1, 2, 5, 8]
+    ff_expansion: [4, 4, 4, 4]
+    reduction_ratio: [8, 4, 2, 1]
+    num_layers: [3,4,18,3] #or [3,4,18,3]
+    decoder_dim: 768
+
+    lora_rank: 0
+
+    multi_scale: True
+    scaling_factor: 1
+    num_register_tokens: 4
+    temporal_dim: 0
+    cross_scale_token_fusion: mean
+    Xregister_type: zigzag
+
+  context_factor_m: ${data.factors_m}
+  context_factor_px: ${data.factors_px}
+  loss_context_factor: 0.1
+  loss_co_pred_factor: 0.1
+  loss_co_embed_factor: 0.0

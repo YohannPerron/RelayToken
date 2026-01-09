@@ -1,0 +1,17 @@
+defaults:
+  - _seg_default
+
+net:
+  _target_: src.models.components.VisionMamba.ViM_module
+  pretrained: False
+  pretrained_path: null
+
+  #Using ViM_S
+  patch_size: 16
+  stride: 16
+  embed_dim: 384
+  depth: 24
+
+  lora_rank: 0
+
+

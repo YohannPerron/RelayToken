@@ -1,0 +1,39 @@
+# @package _global_
+defaults:
+  - _seg_default@model
+
+data:
+  factors_m: [4]
+  factors_px: [1]
+
+model:
+  net:
+    _target_: src.models.components.RT_ViT.RT_ViT
+    num_classes: ${data.num_classes}
+    num_channels:
+      - ${data.num_channels}
+      - ${data.num_channels}
+    img_size: [256,256]
+
+    pretrained: True
+    pretrained_path: ${paths.data_dir}/Models/deit_3_small_224_21k.pth
+
+    patch_size: 16
+    embed_dim: 384
+    depth: 12
+    num_heads: 6
+
+    segmentation_head:
+      _partial_: True
+      _target_: src.models.components.utils.SimpleSegmentationHead #src.models.components.utils.SimpleSegmentationHead
+      decoder_stride: ${model.net.patch_size}
+
+    multi_scale: True
+    num_register_tokens: 4
+    share_patch_embed: False
+
+  context_factor_m: ${data.factors_m}
+  context_factor_px: ${data.factors_px}
+  loss_context_factor: 0.1
+  loss_co_pred_factor: 0.1
+  loss_co_embed_factor: 0.0

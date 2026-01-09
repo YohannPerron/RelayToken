@@ -1,0 +1,38 @@
+# @package _global_
+defaults:
+  - _seg_default@model
+
+data:
+  factors_m: [4]
+  factors_px: [1]
+
+model:
+  net:
+    _target_: src.models.components.Swin_v2.Swin_v2_module
+    num_classes: ${data.num_classes}
+    num_channels:
+      - ${data.num_channels}
+      - ${data.num_channels}
+    img_size: [256,256]
+    pretrained: True
+    pretrained_path: ${paths.data_dir}/Models/swinv2_small_patch4_window8_256.pth
+
+    patch_size: 4
+    window_size: 8
+    embed_dim: 96
+    depths: [2, 2, 18, 2]
+    num_heads: [3, 6, 12, 24]
+    segmentation_head:
+      _partial_: True
+      _target_: src.models.components.utils.SimpleSegmentationHead
+      decoder_stride: 32
+
+    multi_scale: True
+    num_register_tokens: 4
+    share_patch_embed: False
+
+  context_factor_m: ${data.factors_m}
+  context_factor_px: ${data.factors_px}
+  loss_context_factor: 0.1
+  loss_co_pred_factor: 0.1
+  loss_co_embed_factor: 0.0
