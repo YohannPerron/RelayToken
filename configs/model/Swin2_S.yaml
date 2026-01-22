@@ -15,8 +15,6 @@ net:
     _partial_: True
     _target_: src.models.components.utils.SimpleSegmentationHead #src.models.components.utils.SimpleSegmentationHead
     decoder_stride: 32
-  lora_rank: 0
-  use_FPN: False
 
   num_register_tokens: 0
 

@@ -1381,7 +1381,7 @@ class Swin_v2_module(nn.Module):
             self.model,
             self.num_channels,
             self.img_size,
-            temporal_dim=[0,0],
+            temporal_dim=[0,0] if self.multi_scale else 0,
             indices=[0],
         )
         # Add segmentation head

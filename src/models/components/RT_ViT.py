@@ -32,13 +32,11 @@ from collections.abc import Iterable
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
-from src.models.components.multiscaleDoubleNet import extract_and_upsample_center
+from src.models.components.multiscaleDoubleNet import \
+    extract_and_upsample_center
 from src.models.components.utils.seg_blocks import SimpleSegmentationHead
-from src.models.components.utils.utils import (
-    get_first_layer,
-    infer_output,
-    set_first_layer,
-)
+from src.models.components.utils.utils import (get_first_layer, infer_output,
+                                               set_first_layer)
 
 try:
     from typing import Literal
@@ -48,18 +46,10 @@ except ImportError:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.layers import (
-    AttentionPoolLatent,
-    DropPath,
-    LayerType,
-    Mlp,
-    PatchDropout,
-    PatchEmbed,
-    get_act_layer,
-    get_norm_layer,
-    resample_abs_pos_embed,
-    use_fused_attn,
-)
+from timm.layers import (AttentionPoolLatent, DropPath, LayerType, Mlp,
+                         PatchDropout, PatchEmbed, get_act_layer,
+                         get_norm_layer, resample_abs_pos_embed,
+                         use_fused_attn)
 from torch.jit import Final
 
 _logger = logging.getLogger(__name__)
@@ -841,7 +831,7 @@ class RT_ViT(nn.Module):
             self.model,
             self.num_channels,
             self.img_size,
-            temporal_dim=[0,0],
+            temporal_dim=[0,0] if self.multi_scale else 0,
             indices=[0],
         )
         print(self.embed_dim, self.downsample_factor, self.feature_size)
