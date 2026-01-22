@@ -539,34 +539,32 @@ class SwinTransformerV2Block(nn.Module):
 
     def add_context_scale(
         self,
-        feat_size,
-        window_size=None,
-        reg_token_fusion=None,
+        feat_size: Tuple[int, int],
+        window_size: Optional[Tuple[int, int]] = None,
     ):
-        """Add a context scale to the stage.
 
-        Args:
-            feat_size (Tuple[int, int]): Feature size for the context scale.
-            window_size (Tuple[int, int], optional): Window size. Defaults to None.
-            reg_token_fusion (Callable, optional): Function to fuse register tokens from multiple scales. Defaults to None (mean fusion).
-        """
-        self.input_resolution = [self.input_resolution, feat_size]
-        if isinstance(window_size, int):
-            window_size = (window_size, window_size)
-        if window_size is not None:
-            self.window_size = to_2tuple(window_size)
-            self._make_pair_wise_relative_positions(
-                scale=1.0
-                * self.window_size[0]
-                / self.pretrained_window_size[0]
-            )
-        if reg_token_fusion is not None:
-            self.register_token_fusion = reg_token_fusion
-        else:
-            self.register_token_fusion = lambda x: x.mean(dim=1)
+        window_size = window_size if window_size is not None else self.window_size
+        context_window_size, context_shift_size = self._calc_window_shift(
+            to_2tuple(window_size)
+        )
+        self.input_resolutions = [self.input_resolution, feat_size]
+        self.window_size_list = [self.window_size, context_window_size]
+        self.shift_size_list = [self.shift_size, context_shift_size]
+        self.attn.add_context_scale(context_window_size)
 
+        self.set_scale(1)  # switch to context scale
         self.register_buffer(
-            "attn_mask",
+            "attn_mask_context",
+            (
+                None
+                if self.dynamic_mask
+                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
+            ),
+            persistent=False,
+        )
+        self.set_scale(0)  # switch back to main scale
+        self.register_buffer(
+            "attn_mask_main",
             (
                 None
                 if self.dynamic_mask
@@ -577,216 +575,546 @@ class SwinTransformerV2Block(nn.Module):
 
     def set_scale(self, scale: int):
         assert scale in [0, 1], "Scale must be 0 or 1"
+        if self.current_scale == scale:
+            return
+        self.current_scale = scale
+        self.input_resolution = self.input_resolutions[scale]
         self.window_size = self.window_size_list[scale]
-        self.relative_coords_table = (
-            self.relative_coords_table_main
-            if scale == 0
-            else self.relative_coords_table_context
+        self.window_area = self.window_size[0] * self.window_size[1]
+        self.shift_size = self.shift_size_list[scale]
+        self.attn.set_scale(scale)
+        if hasattr(self, "attn_mask_main"):  # if context scale has been fully added
+            self.attn_mask = (
+                self.attn_mask_main if scale == 0 else self.attn_mask_context
+            )
+
+    def _attn(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
+        B, H, W, C = x.shape
+
+        # cyclic shift
+        has_shift = any(self.shift_size)
+        if has_shift:
+            shifted_x = torch.roll(
+                x,
+                shifts=(-self.shift_size[0], -self.shift_size[1]),
+                dims=(1, 2),
+            )
+        else:
+            shifted_x = x
+
+        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
+        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
+        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
+        _, Hp, Wp, _ = shifted_x.shape
+
+        # partition windows
+        x_windows = window_partition(
+            shifted_x, self.window_size
+        )  # B*nW, window_size, window_size, C
+        x_windows = einops.rearrange(
+            x_windows, "BnW nH nW C -> BnW (nH nW) C"
+        )  # B*nW, window_size*window_size, C
+        if self.num_register_tokens > 0:
+            nW = x_windows.shape[0] // B
+            register_token = einops.repeat(register_token, "B R C -> (B nW) R C", nW=nW)
+            x_windows = torch.concat((x_windows, register_token), dim=1)
+            # B*nW, window_size*window_size+R, C
+
+        # W-MSA/SW-MSA
+        if getattr(self, "dynamic_mask", False):
+            attn_mask = self.get_attn_mask(
+                shifted_x, num_register_tokens=self.num_register_tokens
+            )
+        else:
+            if hasattr(self, "scale"):
+                attn_mask = self.attn_mask[self.scale]
+            else:
+                attn_mask = self.attn_mask
+        # Attention step
+        attn_windows = self.attn(
+            x_windows, mask=attn_mask
+        )  # B*nW, window_size*window_size+R, C
+
+        if self.num_register_tokens > 0:
+            register_token = attn_windows[
+                :, -self.num_register_tokens :, :
+            ]  # B*nW, R, C
+            attn_windows = attn_windows[
+                :, : -self.num_register_tokens, :
+            ]  # B*nW, window_size*window_size, C
+        # merge windows
+        attn_windows = einops.rearrange(
+            attn_windows,
+            "BnW (wH wW) C -> BnW wH wW C",
+            wH=self.window_size[0],
+            wW=self.window_size[1],
         )
-        self.relative_position_index = (
-            self.relative_position_index_main
-            if scale == 0
-            else self.relative_position_index_context
+        shifted_x = window_reverse(
+            attn_windows, self.window_size, (Hp, Wp)
+        )  # B H' W' C
+        shifted_x = shifted_x[:, :H, :W, :].contiguous()
+
+        # reverse cyclic shift
+        if has_shift:
+            x = torch.roll(shifted_x, shifts=self.shift_size, dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if self.num_register_tokens > 0:
+            register_token = einops.reduce(
+                register_token, "(B nW) R C -> B R C", reduction="mean", B=B
+            )
+        return x, register_token
+
+    def forward(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
+        B, H, W, C = x.shape
+        if register_token is not None:
+            R = register_token.shape[1]
+        else:
+            R = 0
+        assert R == self.num_register_tokens
+
+        x_att, register_token_att = self._attn(x, register_token)
+        # B H W C -> B (HW+R) C
+        if self.num_register_tokens > 0:
+            fused = torch.concat((x.reshape(B, -1, C), register_token), dim=1)
+            fused_att = torch.concat(
+                (x_att.reshape(B, -1, C), register_token_att), dim=1
+            )
+        else:
+            fused = x.reshape(B, -1, C)
+            fused_att = x_att.reshape(B, -1, C)
+
+        fused = fused + self.drop_path1(self.norm1(fused_att))
+        fused = fused + self.drop_path2(self.norm2(self.mlp(fused)))
+        x = fused[:, : H * W, :].reshape(B, H, W, C)
+        if register_token is not None:
+            register_token = fused[:, H * W :, :].reshape(B, R, C)
+
+        return x, register_token
+
+
+class PatchMerging(nn.Module):
+    """Patch Merging Layer."""
+
+    def __init__(
+        self,
+        dim: int,
+        out_dim: Optional[int] = None,
+        norm_layer: nn.Module = nn.LayerNorm,
+    ):
+        """
+        Args:
+            dim (int): Number of input channels.
+            out_dim (int): Number of output channels (or 2 * dim if None)
+            norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+        """
+        super().__init__()
+        self.dim = dim
+        self.out_dim = out_dim or 2 * dim
+        self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
+        self.norm = norm_layer(self.out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, W, C = x.shape
+
+        pad_values = (0, 0, 0, W % 2, 0, H % 2)
+        x = nn.functional.pad(x, pad_values)
+        _, H, W, _ = x.shape
+
+        x = x.reshape(B, H // 2, 2, W // 2, 2, C).permute(0, 1, 3, 4, 2, 5).flatten(3)
+        x = self.reduction(x)
+        x = self.norm(x)
+        return x
+
+
+class SwinTransformerV2Stage(nn.Module):
+    """A Swin Transformer V2 Stage."""
+
+    def __init__(
+        self,
+        dim: int,
+        out_dim: int,
+        input_resolution: _int_or_tuple_2_t,
+        depth: int,
+        num_heads: int,
+        window_size: _int_or_tuple_2_t,
+        always_partition: bool = False,
+        dynamic_mask: bool = False,
+        downsample: bool = False,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        proj_drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        act_layer: Union[str, Callable] = "gelu",
+        norm_layer: nn.Module = nn.LayerNorm,
+        pretrained_window_size: _int_or_tuple_2_t = 0,
+        output_nchw: bool = False,
+        num_register_tokens: int = 0,
+    ) -> None:
+        """
+        Args:
+            dim: Number of input channels.
+            out_dim: Number of output channels.
+            input_resolution: Input resolution.
+            depth: Number of blocks.
+            num_heads: Number of attention heads.
+            window_size: Local window size.
+            always_partition: Always partition into full windows and shift
+            dynamic_mask: Create attention mask in forward based on current input size
+            downsample: Use downsample layer at start of the block.
+            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
+            qkv_bias: If True, add a learnable bias to query, key, value.
+            proj_drop: Projection dropout rate
+            attn_drop: Attention dropout rate.
+            drop_path: Stochastic depth rate.
+            act_layer: Activation layer type.
+            norm_layer: Normalization layer.
+            pretrained_window_size: Local window size in pretraining.
+            output_nchw: Output tensors on NCHW format instead of NHWC.
+            use_register_token: Whether to use register token
+        """
+        super().__init__()
+        self.dim = dim
+        self.out_dim = out_dim
+        self.input_resolution = input_resolution
+        self.output_resolution = (
+            tuple(i // 2 for i in input_resolution) if downsample else input_resolution
         )
+        self.depth = depth
+        self.output_nchw = output_nchw
+        self.grad_checkpointing = False
+        window_size = to_2tuple(window_size)
+        shift_size = tuple([w // 2 for w in window_size])
+
+        # patch merging / downsample layer
+        if downsample:
+            self.downsample = PatchMerging(
+                dim=dim, out_dim=out_dim, norm_layer=norm_layer
+            )
+        else:
+            assert dim == out_dim
+            self.downsample = nn.Identity()
+
+        # register token
+        self.use_register_token = num_register_tokens > 0
+        if self.use_register_token and downsample:
+            self.downsample_token = nn.Linear(dim, out_dim)
+
+        # build blocks
+        self.blocks = nn.ModuleList(
+            [
+                SwinTransformerV2Block(
+                    dim=out_dim,
+                    input_resolution=self.output_resolution,
+                    num_heads=num_heads,
+                    window_size=window_size,
+                    shift_size=0 if (i % 2 == 0) else shift_size,
+                    always_partition=always_partition,
+                    dynamic_mask=dynamic_mask,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_drop=proj_drop,
+                    attn_drop=attn_drop,
+                    drop_path=(
+                        drop_path[i] if isinstance(drop_path, list) else drop_path
+                    ),
+                    act_layer=act_layer,
+                    norm_layer=norm_layer,
+                    pretrained_window_size=pretrained_window_size,
+                    num_register_tokens=num_register_tokens,
+                )
+                for i in range(depth)
+            ]
+        )
+
+    def set_input_size(
+        self,
+        feat_size: Tuple[int, int],
+        window_size: int,
+        always_partition: Optional[bool] = None,
+    ):
+        """Updates the resolution, window size and so the pair-wise relative positions.
+
+        Args:
+            feat_size: New input (feature) resolution
+            window_size: New window size
+            always_partition: Always partition / shift the window
+        """
+        self.input_resolution = feat_size
+        if isinstance(self.downsample, nn.Identity):
+            self.output_resolution = feat_size
+        else:
+            assert isinstance(self.downsample, PatchMerging)
+            self.output_resolution = tuple(i // 2 for i in feat_size)
+        for block in self.blocks:
+            block.set_input_size(
+                feat_size=self.output_resolution,
+                window_size=window_size,
+                always_partition=always_partition,
+            )
+
+    def add_context_scale(
+        self,
+        feat_size,
+        window_size=None,
+        reg_token_fusion=None,
+    ):
+        self.input_resolution = [self.input_resolution, feat_size]
+        if isinstance(self.downsample, nn.Identity):
+            self.output_resolution = feat_size
+        else:
+            assert isinstance(self.downsample, PatchMerging)
+            self.output_resolution = tuple(i // 2 for i in feat_size)
+
+        for block in self.blocks:
+            block.add_context_scale(
+                feat_size=self.output_resolution,
+                window_size=window_size,
+            )
+
+        if reg_token_fusion is not None:
+            self.reg_token_fusion = reg_token_fusion(self.out_dim)
+        else:
+            self.reg_token_fusion = lambda x: einops.reduce(
+                x, "B R (n C) -> B R C", "mean", C=self.out_dim
+            )
 
     def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+        self, x: List[torch.Tensor], register_token: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        B_, N, C = x.shape
+        for i in range(len(x)):
+            x[i] = self.downsample(x[i])
+        if not isinstance(self.downsample, nn.Identity) and self.use_register_token:
+            register_token = self.downsample_token(register_token)
 
-        if self.q_bias is None:
-            qkv = self.qkv(x)
-        else:
-            qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))
-            if self.qkv_bias_separate:
-                qkv = self.qkv(x)
-                qkv += qkv_bias
+        for blk in self.blocks:
+            register_token_list = []
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                for i in range(len(x)):
+                    blk.set_scale(i)
+                    x[i], updated_register_token = (
+                        torch.utils.checkpoint.checkpoint(
+                            blk, x[i], register_token, use_reentrant=False
+                        )
+                    )
+                    register_token_list.append(updated_register_token)
             else:
-                qkv = F.linear(x, weight=self.qkv.weight, bias=qkv_bias)
-        qkv = qkv.reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+                for i in range(len(x)):
+                    blk.set_scale(i)
+                    x[i], updated_register_token = blk(x[i], register_token)
+                    register_token_list.append(updated_register_token)
 
-        # cosine attention
-        attn = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)
-        logit_scale = torch.clamp(self.logit_scale, max=math.log(1.0 / 0.01)).exp()
-        attn = attn * logit_scale
+            if len(register_token_list) > 1 and self.use_register_token:
+                register_token = torch.concat(
+                    register_token_list, dim=2
+                )  # B, R, n*C
+                register_token = self.reg_token_fusion(register_token)  # B, R, C
+            else:
+                register_token = register_token_list[0]
 
-        relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(
-            -1, self.num_heads
-        )
-        relative_position_bias = relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1,
-        )  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(
-            2, 0, 1
-        ).contiguous()  # nH, Wh*Ww, Wh*Ww
-        relative_position_bias = 16 * torch.sigmoid(relative_position_bias)
-        if self.num_register_tokens > 0:
-            relative_position_bias = nn.functional.pad(
-                relative_position_bias,
-                (0, self.num_register_tokens, 0, self.num_register_tokens),
-                "constant",
-                0,
-            )
-        attn = attn + relative_position_bias.unsqueeze(0)
+        return x, register_token
 
-        if mask is not None:
-            num_win = mask.shape[0]
-            attn = attn.view(-1, num_win, self.num_heads, N, N) + mask.unsqueeze(
-                1
-            ).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
-
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+    def _init_respostnorm(self) -> None:
+        for blk in self.blocks:
+            nn.init.constant_(blk.norm1.bias, 0)
+            nn.init.constant_(blk.norm1.weight, 0)
+            nn.init.constant_(blk.norm2.bias, 0)
+            nn.init.constant_(blk.norm2.weight, 0)
 
 
-class SwinTransformerV2Stage(nn.Module):
-    """A Swin Transformer V2 Stage."""
+class SwinTransformerV2(nn.Module):
+    """Swin Transformer V2
+
+    A PyTorch impl of : `Swin Transformer V2: Scaling Up Capacity and Resolution`
+        - https://arxiv.org/abs/2111.09883
+    """
 
     def __init__(
         self,
-        dim: int,
-        out_dim: int,
-        input_resolution: _int_or_tuple_2_t,
-        depth: int,
-        num_heads: int,
-        window_size: _int_or_tuple_2_t,
+        img_size: _int_or_tuple_2_t = 224,
+        patch_size: int = 4,
+        in_chans: int = 3,
+        num_classes: int = 1000,
+        global_pool: str = "avg",
+        embed_dim: int = 96,
+        depths: Tuple[int, ...] = (2, 2, 6, 2),
+        num_heads: Tuple[int, ...] = (3, 6, 12, 24),
+        window_size: _int_or_tuple_2_t = 7,
         always_partition: bool = False,
-        dynamic_mask: bool = False,
-        downsample: bool = False,
+        strict_img_size: bool = True,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
-        proj_drop: float = 0.0,
-        attn_drop: float = 0.0,
-        drop_path: float = 0.0,
+        drop_rate: float = 0.0,
+        proj_drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        drop_path_rate: float = 0.1,
         act_layer: Union[str, Callable] = "gelu",
-        norm_layer: nn.Module = nn.LayerNorm,
-        pretrained_window_size: _int_or_tuple_2_t = 0,
-        output_nchw: bool = False,
+        norm_layer: Callable = nn.LayerNorm,
+        pretrained_window_sizes: Tuple[int, ...] = (0, 0, 0, 0),
         num_register_tokens: int = 0,
-    ) -> None:
+        **kwargs,
+    ):
         """
         Args:
-            dim: Number of input channels.
-            out_dim: Number of output channels.
-            input_resolution: Input resolution.
-            depth: Number of blocks.
-            num_heads: Number of attention heads.
-            window_size: Local window size.
-            always_partition: Always partition into full windows and shift
-            dynamic_mask: Create attention mask in forward based on current input size
-            downsample: Use downsample layer at start of the block.
+            img_size: Input image size.
+            patch_size: Patch size.
+            in_chans: Number of input image channels.
+            num_classes: Number of classes for classification head.
+            embed_dim: Patch embedding dimension.
+            depths: Depth of each Swin Transformer stage (layer).
+            num_heads: Number of attention heads in different layers.
+            window_size: Window size.
             mlp_ratio: Ratio of mlp hidden dim to embedding dim.
             qkv_bias: If True, add a learnable bias to query, key, value.
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate.
-            drop_path: Stochastic depth rate.
-            act_layer: Activation layer type.
+            drop_rate: Head dropout rate.
+            proj_drop_rate: Projection dropout rate.
+            attn_drop_rate: Attention dropout rate.
+            drop_path_rate: Stochastic depth rate.
             norm_layer: Normalization layer.
-            pretrained_window_size: Local window size in pretraining.
-            output_nchw: Output tensors on NCHW format instead of NHWC.
-            use_register_token: Whether to use register token
+            act_layer: Activation layer type.
+            patch_norm: If True, add normalization after patch embedding.
+            pretrained_window_sizes: Pretrained window sizes of each layer.
+            output_fmt: Output tensor format if not None, otherwise output 'NHWC' by default.
         """
         super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim
-        self.input_resolution = input_resolution
-        self.output_resolution = (
-            tuple(i // 2 for i in input_resolution) if downsample else input_resolution
-        )
-        self.depth = depth
-        self.output_nchw = output_nchw
-        self.grad_checkpointing = False
-        window_size = to_2tuple(window_size)
-        shift_size = tuple([w // 2 for w in window_size])
 
-        # patch merging / downsample layer
-        if downsample:
-            self.downsample = PatchMerging(
-                dim=dim, out_dim=out_dim, norm_layer=norm_layer
-            )
-        else:
-            assert dim == out_dim
-            self.downsample = nn.Identity()
+        self.num_classes = num_classes
+        assert global_pool in ("", "avg")
+        self.global_pool = global_pool
+        self.output_fmt = "NHWC"
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.num_features = self.head_hidden_size = int(
+            embed_dim * 2 ** (self.num_layers - 1)
+        )
+        self.feature_info = []
+
+        if not isinstance(embed_dim, (tuple, list)):
+            embed_dim = [int(embed_dim * 2**i) for i in range(self.num_layers)]
+
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim[0],
+            norm_layer=norm_layer,
+            strict_img_size=strict_img_size,
+            output_fmt="NHWC",
+        )
+        grid_size = self.patch_embed.grid_size
 
         # register token
         self.use_register_token = num_register_tokens > 0
-        if self.use_register_token and downsample:
-            self.downsample_token = nn.Linear(dim, out_dim)
+        if self.use_register_token:
+            self.register_token = nn.Parameter(
+                torch.randn(1, num_register_tokens, self.embed_dim), requires_grad=True
+            )
+        else:
+            self.register_token = None
 
-        # build blocks
-        self.blocks = nn.ModuleList(
-            [
-                SwinTransformerV2Block(
-                    dim=out_dim,
-                    input_resolution=self.output_resolution,
-                    num_heads=num_heads,
+        dpr = [
+            x.tolist()
+            for x in torch.linspace(0, drop_path_rate, sum(depths)).split(depths)
+        ]
+        layers = []
+        in_dim = embed_dim[0]
+        scale = 1
+        for i in range(self.num_layers):
+            out_dim = embed_dim[i]
+            layers += [
+                SwinTransformerV2Stage(
+                    dim=in_dim,
+                    out_dim=out_dim,
+                    input_resolution=(
+                        grid_size[0] // scale,
+                        grid_size[1] // scale,
+                    ),
+                    depth=depths[i],
+                    downsample=i > 0,
+                    num_heads=num_heads[i],
                     window_size=window_size,
-                    shift_size=0 if (i % 2 == 0) else shift_size,
                     always_partition=always_partition,
-                    dynamic_mask=dynamic_mask,
+                    dynamic_mask=not strict_img_size,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
-                    proj_drop=proj_drop,
-                    attn_drop=attn_drop,
-                    drop_path=(
-                        drop_path[i] if isinstance(drop_path, list) else drop_path
-                    ),
+                    proj_drop=proj_drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[i],
                     act_layer=act_layer,
                     norm_layer=norm_layer,
-                    pretrained_window_size=pretrained_window_size,
+                    pretrained_window_size=pretrained_window_sizes[i],
                     num_register_tokens=num_register_tokens,
                 )
-                for i in range(depth)
             ]
+            in_dim = out_dim
+            if i > 0:
+                scale *= 2
+            self.feature_info += [
+                dict(num_chs=out_dim, reduction=4 * scale, module=f"layers.{i}")
+            ]
+
+        self.layers = nn.Sequential(*layers)
+        self.norm = norm_layer(self.num_features)
+        self.head = ClassifierHead(
+            self.num_features,
+            num_classes,
+            pool_type=global_pool,
+            drop_rate=drop_rate,
+            input_fmt=self.output_fmt,
         )
+
+        self.apply(self._init_weights)
+        for bly in self.layers:
+            bly._init_respostnorm()
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def set_input_size(
         self,
-        feat_size: Tuple[int, int],
-        window_size: int,
+        img_size: Optional[Tuple[int, int]] = None,
+        patch_size: Optional[Tuple[int, int]] = None,
+        window_size: Optional[Tuple[int, int]] = None,
+        window_ratio: Optional[int] = 8,
         always_partition: Optional[bool] = None,
     ):
-        """Updates the resolution, window size and so the pair-wise relative positions.
+        """Updates the image resolution, window size, and so the pair-wise relative positions.
 
         Args:
-            feat_size: New input (feature) resolution
-            window_size: New window size
-            always_partition: Always partition / shift the window
+            img_size (Optional[Tuple[int, int]]): New input resolution, if None current resolution is used
+            patch_size (Optional[Tuple[int, int]): New patch size, if None use current patch size
+            window_size (Optional[int]): New window size, if None based on new_img_size // window_div
+            window_ratio (int): divisor for calculating window size from patch grid size
+            always_partition: always partition / shift windows even if feat size is < window
         """
-        self.input_resolution = feat_size
-        if isinstance(self.downsample, nn.Identity):
-            self.output_resolution = feat_size
-        else:
-            assert isinstance(self.downsample, PatchMerging)
-            self.output_resolution = tuple(i // 2 for i in feat_size)
-        for block in self.blocks:
-            block.set_input_size(
-                feat_size=self.output_resolution,
+        if img_size is not None or patch_size is not None:
+            self.patch_embed.set_input_size(img_size=img_size, patch_size=patch_size)
+            grid_size = self.patch_embed.grid_size
+
+        if window_size is None and window_ratio is not None:
+            window_size = tuple([s // window_ratio for s in grid_size])
+
+        for index, stage in enumerate(self.layers):
+            stage_scale = 2 ** max(index - 1, 0)
+            stage.set_input_size(
+                feat_size=(
+                    grid_size[0] // stage_scale,
+                    grid_size[1] // stage_scale,
+                ),
                 window_size=window_size,
                 always_partition=always_partition,
             )
 
     def add_context_scale(
         self,
-        feat_size,
+        img_size,
+        patch_size=None,
         window_size=None,
         reg_token_fusion=None,
         share_patch_embed: Optional[bool] = False,
@@ -794,1080 +1122,308 @@ class SwinTransformerV2Stage(nn.Module):
         """Add a new scale to the model.
 
         Args:
-            img_size (int or Tuple[int, int]): New image size for the context scale.
-            patch_size (int, optional): Patch size. Defaults to None (uses existing patch size).
-            window_size (int, optional): Window size. Defaults to None.
-            reg_token_fusion (Callable, optional): Function to fuse register tokens from multiple scales. Defaults to None (mean fusion).
-            share_patch_embed (bool, optional): Whether to share patch embedding between scales. Defaults to False.
+            img_size (int): New image size.
+            num_channels (int): Number of channels.
+            patch_size (int): Patch size.
+            window_size (int): Window size.
+            reg_token_fusion (Callable): Function to fuse register tokens. Default is mean.
         """
-        if window_size is not None and isinstance(window_size, int):
-            window_size = (window_size, window_size)
-        context_window_size, context_shift_size = self._calc_window_shift(
-            to_2tuple(window_size)
-        )
-        self.input_resolutions = [self.input_resolution, feat_size]
-        self.window_size_list = [self.window_size, context_window_size]
-        self.shift_size_list = [self.shift_size, context_shift_size]
-        self.attn.add_context_scale(context_window_size)
+        if patch_size is None:
+            patch_size = self.patch_embed.patch_size
 
-        self.set_scale(1)  # switch to context scale
-        self.register_buffer(
-            "attn_mask_context",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-        self.set_scale(0)  # switch back to main scale
-        self.register_buffer(
-            "attn_mask_main",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-
-    def set_scale(self, scale: int):
-        assert scale in [0, 1], "Scale must be 0 or 1"
-        if self.current_scale == scale:
-            return
-        self.current_scale = scale
-        self.input_resolution = self.input_resolutions[scale]
-        self.window_size = self.window_size_list[scale]
-        self.window_area = self.window_size[0] * self.window_size[1]
-        self.shift_size = self.shift_size_list[scale]
-        self.attn.set_scale(scale)
-        if hasattr(self, "attn_mask_main"):  # if context scale has been fully added
-            self.attn_mask = (
-                self.attn_mask_main if scale == 0 else self.attn_mask_context
-            )
-
-    def _attn(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-
-        # cyclic shift
-        has_shift = any(self.shift_size)
-        if has_shift:
-            shifted_x = torch.roll(
-                x,
-                shifts=(-self.shift_size[0], -self.shift_size[1]),
-                dims=(1, 2),
-            )
+        if share_patch_embed:
+            patch_embed = self.patch_embed
+            grid_size = patch_embed.grid_size
+            self.patch_embed = nn.ModuleList([patch_embed, patch_embed])
         else:
-            shifted_x = x
+            main_patch_embed = deepcopy(self.patch_embed)
+            context_patch_embed = self.patch_embed
+            context_patch_embed.set_input_size(img_size=img_size, patch_size=patch_size)
+            grid_size = context_patch_embed.grid_size
+            self.patch_embed = nn.ModuleList([main_patch_embed, context_patch_embed])
 
-        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
-        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
-        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
-        _, Hp, Wp, _ = shifted_x.shape
-
-        # partition windows
-        x_windows = window_partition(
-            shifted_x, self.window_size
-        )  # B*nW, window_size, window_size, C
-        x_windows = einops.rearrange(
-            x_windows, "BnW nH nW C -> BnW (nH nW) C"
-        )  # B*nW, window_size*window_size, C
-        if self.num_register_tokens > 0:
-            nW = x_windows.shape[0] // B
-            register_token = einops.repeat(register_token, "B R C -> (B nW) R C", nW=nW)
-            x_windows = torch.concat((x_windows, register_token), dim=1)
-            # B*nW, window_size*window_size+R, C
-
-        # W-MSA/SW-MSA
-        if getattr(self, "dynamic_mask", False):
-            attn_mask = self.get_attn_mask(
-                shifted_x, num_register_tokens=self.num_register_tokens
+        for index, stage in enumerate(self.layers):
+            stage_scale = 2 ** max(index - 1, 0)
+            stage.add_context_scale(
+                feat_size=(
+                    grid_size[0] // stage_scale,
+                    grid_size[1] // stage_scale,
+                ),
+                window_size=window_size,
+                reg_token_fusion=reg_token_fusion,
             )
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        nod = set()
+        for n, m in self.named_modules():
+            if any([kw in n for kw in ("cpb_mlp", "logit_scale")]):
+                nod.add(n)
+        return nod
+
+    @torch.jit.ignore
+    def group_matcher(self, coarse=False):
+        return dict(
+            stem=r"^absolute_pos_embed|patch_embed",  # stem and embed
+            blocks=(
+                r"^layers\.(\d+)"
+                if coarse
+                else [
+                    (r"^layers\.(\d+).downsample", (0,)),
+                    (r"^layers\.(\d+)\.\w+\.(\d+)", None),
+                    (r"^norm", (99999,)),
+                ]
+            ),
+        )
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        for l in self.layers:
+            l.grad_checkpointing = enable
+
+    @torch.jit.ignore
+    def get_classifier(self) -> nn.Module:
+        return self.head.fc
+
+    def forward_features(self, x: _input_with_context, BCHW=True):
+        if isinstance(x, Iterable) and not isinstance(x, torch.Tensor):
+            x = x  # [high_res, low_res]
         else:
-            if hasattr(self, "scale"):
-                attn_mask = self.attn_mask[self.scale]
+            x = [x]  # [high_res]
+
+        B, H, W, C = x[0].shape
+        if self.use_register_token:
+            register_token = self.register_token.repeat(B, 1, 1)
+        else:
+            register_token = None
+
+        for i in range(len(x)):
+            if isinstance(self.patch_embed, nn.ModuleList):
+                x[i] = self.patch_embed[i](x[i])
             else:
-                attn_mask = self.attn_mask
-        # Attention step
-        attn_windows = self.attn(
-            x_windows, mask=attn_mask
-        )  # B*nW, window_size*window_size+R, C
+                x[i] = self.patch_embed(x[i])
 
-        if self.num_register_tokens > 0:
-            register_token = attn_windows[
-                :, -self.num_register_tokens :, :
-            ]  # B*nW, R, C
-            attn_windows = attn_windows[
-                :, : -self.num_register_tokens, :
-            ]  # B*nW, window_size*window_size, C
-        # merge windows
-        attn_windows = einops.rearrange(
-            attn_windows,
-            "BnW (wH wW) C -> BnW wH wW C",
-            wH=self.window_size[0],
-            wW=self.window_size[1],
-        )
-        shifted_x = window_reverse(
-            attn_windows, self.window_size, (Hp, Wp)
-        )  # B H' W' C
-        shifted_x = shifted_x[:, :H, :W, :].contiguous()
+        for layer in self.layers:
+            x, register_token = layer(x, register_token)
 
-        # reverse cyclic shift
-        if has_shift:
-            x = torch.roll(shifted_x, shifts=self.shift_size, dims=(1, 2))
-        else:
-            x = shifted_x
+        for i in range(len(x)):
+            x[i] = self.norm(x[i])
+            if BCHW:
+                # convert output from BHWC to BCHW
+                x[i] = x[i].permute(0, 3, 1, 2).contiguous()
+        return x
 
-        if self.num_register_tokens > 0:
-            register_token = einops.reduce(
-                register_token, "(B nW) R C -> B R C", reduction="mean", B=B
-            )
-        return x, register_token
+    def forward_head(self, x, pre_logits: bool = False):
+        return self.head(x, pre_logits=True) if pre_logits else self.head(x)
 
-    def forward(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-        if register_token is not None:
-            R = register_token.shape[1]
-        else:
-            R = 0
-        assert R == self.num_register_tokens
-
-        x_att, register_token_att = self._attn(x, register_token)
-        # B H W C -> B (HW+R) C
-        if self.num_register_tokens > 0:
-            fused = torch.concat((x.reshape(B, -1, C), register_token), dim=1)
-            fused_att = torch.concat(
-                (x_att.reshape(B, -1, C), register_token_att), dim=1
-            )
-        else:
-            fused = x.reshape(B, -1, C)
-            fused_att = x_att.reshape(B, -1, C)
-
-        fused = fused + self.drop_path1(self.norm1(fused_att))
-        fused = fused + self.drop_path2(self.norm2(self.mlp(fused)))
-        x = fused[:, : H * W, :].reshape(B, H, W, C)
-        if register_token is not None:
-            register_token = fused[:, H * W :, :].reshape(B, R, C)
-
-        return x, register_token
-
-
-class PatchMerging(nn.Module):
-    """Patch Merging Layer."""
-
-    def __init__(
-        self,
-        dim: int,
-        out_dim: Optional[int] = None,
-        norm_layer: nn.Module = nn.LayerNorm,
-    ):
-        """
-        Args:
-            dim (int): Number of input channels.
-            out_dim (int): Number of output channels (or 2 * dim if None)
-            norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-        """
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim or 2 * dim
-        self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
-        self.norm = norm_layer(self.out_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-
-        pad_values = (0, 0, 0, W % 2, 0, H % 2)
-        x = nn.functional.pad(x, pad_values)
-        _, H, W, _ = x.shape
-
-        x = x.reshape(B, H // 2, 2, W // 2, 2, C).permute(0, 1, 3, 4, 2, 5).flatten(3)
-        x = self.reduction(x)
-        x = self.norm(x)
+    def forward(self, x: _input_with_context):
+        x = self.forward_features(x, BCHW=False)
+        x = self.forward_head(x)
         return x
 
 
-class SwinTransformerV2Stage(nn.Module):
-    """A Swin Transformer V2 Stage."""
+def checkpoint_filter_fn(state_dict, model):
+    state_dict = state_dict.get("model", state_dict)
+    state_dict = state_dict.get("state_dict", state_dict)
+    native_checkpoint = "head.fc.weight" in state_dict
+    out_dict = {}
+    import re
 
-    def __init__(
-        self,
-        dim: int,
-        out_dim: int,
-        input_resolution: _int_or_tuple_2_t,
-        depth: int,
-        num_heads: int,
-        window_size: _int_or_tuple_2_t,
-        always_partition: bool = False,
-        dynamic_mask: bool = False,
-        downsample: bool = False,
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        proj_drop: float = 0.0,
-        attn_drop: float = 0.0,
-        drop_path: float = 0.0,
-        act_layer: Union[str, Callable] = "gelu",
-        norm_layer: nn.Module = nn.LayerNorm,
-        pretrained_window_size: _int_or_tuple_2_t = 0,
-        output_nchw: bool = False,
-        num_register_tokens: int = 0,
-    ) -> None:
-        """
-        Args:
-            dim: Number of input channels.
-            out_dim: Number of output channels.
-            input_resolution: Input resolution.
-            depth: Number of blocks.
-            num_heads: Number of attention heads.
-            window_size: Local window size.
-            always_partition: Always partition into full windows and shift
-            dynamic_mask: Create attention mask in forward based on current input size
-            downsample: Use downsample layer at start of the block.
-            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
-            qkv_bias: If True, add a learnable bias to query, key, value.
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate.
-            drop_path: Stochastic depth rate.
-            act_layer: Activation layer type.
-            norm_layer: Normalization layer.
-            pretrained_window_size: Local window size in pretraining.
-            output_nchw: Output tensors on NCHW format instead of NHWC.
-            use_register_token: Whether to use register token
-        """
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim
-        self.input_resolution = input_resolution
-        self.output_resolution = (
-            tuple(i // 2 for i in input_resolution) if downsample else input_resolution
-        )
-        self.depth = depth
-        self.output_nchw = output_nchw
-        self.grad_checkpointing = False
-        window_size = to_2tuple(window_size)
-        shift_size = tuple([w // 2 for w in window_size])
-
-        # patch merging / downsample layer
-        if downsample:
-            self.downsample = PatchMerging(
-                dim=dim, out_dim=out_dim, norm_layer=norm_layer
-            )
-        else:
-            assert dim == out_dim
-            self.downsample = nn.Identity()
-
-        # register token
-        self.use_register_token = num_register_tokens > 0
-        if self.use_register_token and downsample:
-            self.downsample_token = nn.Linear(dim, out_dim)
-
-        # build blocks
-        self.blocks = nn.ModuleList(
+    for k, v in state_dict.items():
+        if k.startswith("head."):
+            continue  # we don't use head weights
+        if any(
             [
-                SwinTransformerV2Block(
-                    dim=out_dim,
-                    input_resolution=self.output_resolution,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 if (i % 2 == 0) else shift_size,
-                    always_partition=always_partition,
-                    dynamic_mask=dynamic_mask,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    proj_drop=proj_drop,
-                    attn_drop=attn_drop,
-                    drop_path=(
-                        drop_path[i] if isinstance(drop_path, list) else drop_path
-                    ),
-                    act_layer=act_layer,
-                    norm_layer=norm_layer,
-                    pretrained_window_size=pretrained_window_size,
-                    num_register_tokens=num_register_tokens,
+                n in k
+                for n in (
+                    "relative_position_index",
+                    "relative_coords_table",
+                    "attn_mask",
                 )
-                for i in range(depth)
             ]
-        )
+        ):
+            continue  # skip buffers that should not be persistent
 
-    def set_input_size(
-        self,
-        feat_size: Tuple[int, int],
-        window_size: int,
-        always_partition: Optional[bool] = None,
-    ):
-        """Updates the resolution, window size and so the pair-wise relative positions.
-
-        Args:
-            feat_size: New input (feature) resolution
-            window_size: New window size
-            always_partition: Always partition / shift the window
-        """
-        self.input_resolution = feat_size
-        if isinstance(self.downsample, nn.Identity):
-            self.output_resolution = feat_size
-        else:
-            assert isinstance(self.downsample, PatchMerging)
-            self.output_resolution = tuple(i // 2 for i in feat_size)
-        for block in self.blocks:
-            block.set_input_size(
-                feat_size=self.output_resolution,
-                window_size=window_size,
-                always_partition=always_partition,
-            )
-
-    def add_context_scale(
-        self,
-        feat_size,
-        window_size=None,
-        reg_token_fusion=None,
-        share_patch_embed: Optional[bool] = False,
-    ):
-        """Add a new scale to the model.
-
-        Args:
-            img_size (int or Tuple[int, int]): New image size for the context scale.
-            patch_size (int, optional): Patch size. Defaults to None (uses existing patch size).
-            window_size (int, optional): Window size. Defaults to None.
-            reg_token_fusion (Callable, optional): Function to fuse register tokens from multiple scales. Defaults to None (mean fusion).
-            share_patch_embed (bool, optional): Whether to share patch embedding between scales. Defaults to False.
-        """
-        if window_size is not None and isinstance(window_size, int):
-            window_size = (window_size, window_size)
-        context_window_size, context_shift_size = self._calc_window_shift(
-            to_2tuple(window_size)
-        )
-        self.input_resolutions = [self.input_resolution, feat_size]
-        self.window_size_list = [self.window_size, context_window_size]
-        self.shift_size_list = [self.shift_size, context_shift_size]
-        self.attn.add_context_scale(context_window_size)
-
-        self.set_scale(1)  # switch to context scale
-        self.register_buffer(
-            "attn_mask_context",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-        self.set_scale(0)  # switch back to main scale
-        self.register_buffer(
-            "attn_mask_main",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-
-    def set_scale(self, scale: int):
-        assert scale in [0, 1], "Scale must be 0 or 1"
-        if self.current_scale == scale:
-            return
-        self.current_scale = scale
-        self.input_resolution = self.input_resolutions[scale]
-        self.window_size = self.window_size_list[scale]
-        self.window_area = self.window_size[0] * self.window_size[1]
-        self.shift_size = self.shift_size_list[scale]
-        self.attn.set_scale(scale)
-        if hasattr(self, "attn_mask_main"):  # if context scale has been fully added
-            self.attn_mask = (
-                self.attn_mask_main if scale == 0 else self.attn_mask_context
-            )
-
-    def _attn(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-
-        # cyclic shift
-        has_shift = any(self.shift_size)
-        if has_shift:
-            shifted_x = torch.roll(
-                x,
-                shifts=(-self.shift_size[0], -self.shift_size[1]),
-                dims=(1, 2),
-            )
-        else:
-            shifted_x = x
-
-        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
-        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
-        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
-        _, Hp, Wp, _ = shifted_x.shape
-
-        # partition windows
-        x_windows = window_partition(
-            shifted_x, self.window_size
-        )  # B*nW, window_size, window_size, C
-        x_windows = einops.rearrange(
-            x_windows, "BnW nH nW C -> BnW (nH nW) C"
-        )  # B*nW, window_size*window_size, C
-        if self.num_register_tokens > 0:
-            nW = x_windows.shape[0] // B
-            register_token = einops.repeat(register_token, "B R C -> (B nW) R C", nW=nW)
-            x_windows = torch.concat((x_windows, register_token), dim=1)
-            # B*nW, window_size*window_size+R, C
-
-        # W-MSA/SW-MSA
-        if getattr(self, "dynamic_mask", False):
-            attn_mask = self.get_attn_mask(
-                shifted_x, num_register_tokens=self.num_register_tokens
-            )
-        else:
-            if hasattr(self, "scale"):
-                attn_mask = self.attn_mask[self.scale]
-            else:
-                attn_mask = self.attn_mask
-        # Attention step
-        attn_windows = self.attn(
-            x_windows, mask=attn_mask
-        )  # B*nW, window_size*window_size+R, C
-
-        if self.num_register_tokens > 0:
-            register_token = attn_windows[
-                :, -self.num_register_tokens :, :
-            ]  # B*nW, R, C
-            attn_windows = attn_windows[
-                :, : -self.num_register_tokens, :
-            ]  # B*nW, window_size*window_size, C
-        # merge windows
-        attn_windows = einops.rearrange(
-            attn_windows,
-            "BnW (wH wW) C -> BnW wH wW C",
-            wH=self.window_size[0],
-            wW=self.window_size[1],
-        )
-        shifted_x = window_reverse(
-            attn_windows, self.window_size, (Hp, Wp)
-        )  # B H' W' C
-        shifted_x = shifted_x[:, :H, :W, :].contiguous()
-
-        # reverse cyclic shift
-        if has_shift:
-            x = torch.roll(shifted_x, shifts=self.shift_size, dims=(1, 2))
-        else:
-            x = shifted_x
-
-        if self.num_register_tokens > 0:
-            register_token = einops.reduce(
-                register_token, "(B nW) R C -> B R C", reduction="mean", B=B
-            )
-        return x, register_token
-
-    def forward(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-        if register_token is not None:
-            R = register_token.shape[1]
-        else:
-            R = 0
-        assert R == self.num_register_tokens
-
-        x_att, register_token_att = self._attn(x, register_token)
-        # B H W C -> B (HW+R) C
-        if self.num_register_tokens > 0:
-            fused = torch.concat((x.reshape(B, -1, C), register_token), dim=1)
-            fused_att = torch.concat(
-                (x_att.reshape(B, -1, C), register_token_att), dim=1
-            )
-        else:
-            fused = x.reshape(B, -1, C)
-            fused_att = x_att.reshape(B, -1, C)
-
-        fused = fused + self.drop_path1(self.norm1(fused_att))
-        fused = fused + self.drop_path2(self.norm2(self.mlp(fused)))
-        x = fused[:, : H * W, :].reshape(B, H, W, C)
-        if register_token is not None:
-            register_token = fused[:, H * W :, :].reshape(B, R, C)
-
-        return x, register_token
-
-
-class PatchMerging(nn.Module):
-    """Patch Merging Layer."""
-
-    def __init__(
-        self,
-        dim: int,
-        out_dim: Optional[int] = None,
-        norm_layer: nn.Module = nn.LayerNorm,
-    ):
-        """
-        Args:
-            dim (int): Number of input channels.
-            out_dim (int): Number of output channels (or 2 * dim if None)
-            norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-        """
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim or 2 * dim
-        self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
-        self.norm = norm_layer(self.out_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-
-        pad_values = (0, 0, 0, W % 2, 0, H % 2)
-        x = nn.functional.pad(x, pad_values)
-        _, H, W, _ = x.shape
-
-        x = x.reshape(B, H // 2, 2, W // 2, 2, C).permute(0, 1, 3, 4, 2, 5).flatten(3)
-        x = self.reduction(x)
-        x = self.norm(x)
-        return x
-
-
-class SwinTransformerV2Stage(nn.Module):
-    """A Swin Transformer V2 Stage."""
-
-    def __init__(
-        self,
-        dim: int,
-        out_dim: int,
-        input_resolution: _int_or_tuple_2_t,
-        depth: int,
-        num_heads: int,
-        window_size: _int_or_tuple_2_t,
-        always_partition: bool = False,
-        dynamic_mask: bool = False,
-        downsample: bool = False,
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        proj_drop: float = 0.0,
-        attn_drop: float = 0.0,
-        drop_path: float = 0.0,
-        act_layer: Union[str, Callable] = "gelu",
-        norm_layer: nn.Module = nn.LayerNorm,
-        pretrained_window_size: _int_or_tuple_2_t = 0,
-        output_nchw: bool = False,
-        num_register_tokens: int = 0,
-    ) -> None:
-        """
-        Args:
-            dim: Number of input channels.
-            out_dim: Number of output channels.
-            input_resolution: Input resolution.
-            depth: Number of blocks.
-            num_heads: Number of attention heads.
-            window_size: Local window size.
-            always_partition: Always partition into full windows and shift
-            dynamic_mask: Create attention mask in forward based on current input size
-            downsample: Use downsample layer at start of the block.
-            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
-            qkv_bias: If True, add a learnable bias to query, key, value.
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate.
-            drop_path: Stochastic depth rate.
-            act_layer: Activation layer type.
-            norm_layer: Normalization layer.
-            pretrained_window_size: Local window size in pretraining.
-            output_nchw: Output tensors on NCHW format instead of NHWC.
-            use_register_token: Whether to use register token
-        """
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim
-        self.input_resolution = input_resolution
-        self.output_resolution = (
-            tuple(i // 2 for i in input_resolution) if downsample else input_resolution
-        )
-        self.depth = depth
-        self.output_nchw = output_nchw
-        self.grad_checkpointing = False
-        window_size = to_2tuple(window_size)
-        shift_size = tuple([w // 2 for w in window_size])
-
-        # patch merging / downsample layer
-        if downsample:
-            self.downsample = PatchMerging(
-                dim=dim, out_dim=out_dim, norm_layer=norm_layer
-            )
-        else:
-            assert dim == out_dim
-            self.downsample = nn.Identity()
-
-        # register token
-        self.use_register_token = num_register_tokens > 0
-        if self.use_register_token and downsample:
-            self.downsample_token = nn.Linear(dim, out_dim)
-
-        # build blocks
-        self.blocks = nn.ModuleList(
-            [
-                SwinTransformerV2Block(
-                    dim=out_dim,
-                    input_resolution=self.output_resolution,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 if (i % 2 == 0) else shift_size,
-                    always_partition=always_partition,
-                    dynamic_mask=dynamic_mask,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    proj_drop=proj_drop,
-                    attn_drop=attn_drop,
-                    drop_path=(
-                        drop_path[i] if isinstance(drop_path, list) else drop_path
-                    ),
-                    act_layer=act_layer,
-                    norm_layer=norm_layer,
-                    pretrained_window_size=pretrained_window_size,
-                    num_register_tokens=num_register_tokens,
+        if "patch_embed.proj.weight" in k:
+            _, _, H, W = model.patch_embed.proj.weight.shape
+            if v.shape[-2] != H or v.shape[-1] != W:
+                v = resample_patch_embed(
+                    v,
+                    (H, W),
+                    interpolation="bicubic",
+                    antialias=True,
+                    verbose=True,
                 )
-                for i in range(depth)
-            ]
-        )
 
-    def set_input_size(
-        self,
-        feat_size: Tuple[int, int],
-        window_size: int,
-        always_partition: Optional[bool] = None,
-    ):
-        """Updates the resolution, window size and so the pair-wise relative positions.
-
-        Args:
-            feat_size: New input (feature) resolution
-            window_size: New window size
-            always_partition: Always partition / shift the window
-        """
-        self.input_resolution = feat_size
-        if isinstance(self.downsample, nn.Identity):
-            self.output_resolution = feat_size
-        else:
-            assert isinstance(self.downsample, PatchMerging)
-            self.output_resolution = tuple(i // 2 for i in feat_size)
-        for block in self.blocks:
-            block.set_input_size(
-                feat_size=self.output_resolution,
-                window_size=window_size,
-                always_partition=always_partition,
+        if not native_checkpoint:
+            # skip layer remapping for updated checkpoints
+            k = re.sub(
+                r"layers.(\d+).downsample",
+                lambda x: f"layers.{int(x.group(1)) + 1}.downsample",
+                k,
             )
+            k = k.replace("head.", "head.fc.")
+        out_dict[k] = v
 
-    def add_context_scale(
-        self,
-        feat_size,
-        window_size=None,
-        reg_token_fusion=None,
-        share_patch_embed: Optional[bool] = False,
-    ):
-        """Add a new scale to the model.
-
-        Args:
-            img_size (int or Tuple[int, int]): New image size for the context scale.
-            patch_size (int, optional): Patch size. Defaults to None (uses existing patch size).
-            window_size (int, optional): Window size. Defaults to None.
-            reg_token_fusion (Callable, optional): Function to fuse register tokens from multiple scales. Defaults to None (mean fusion).
-            share_patch_embed (bool, optional): Whether to share patch embedding between scales. Defaults to False.
-        """
-        if window_size is not None and isinstance(window_size, int):
-            window_size = (window_size, window_size)
-        context_window_size, context_shift_size = self._calc_window_shift(
-            to_2tuple(window_size)
-        )
-        self.input_resolutions = [self.input_resolution, feat_size]
-        self.window_size_list = [self.window_size, context_window_size]
-        self.shift_size_list = [self.shift_size, context_shift_size]
-        self.attn.add_context_scale(context_window_size)
-
-        self.set_scale(1)  # switch to context scale
-        self.register_buffer(
-            "attn_mask_context",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-        self.set_scale(0)  # switch back to main scale
-        self.register_buffer(
-            "attn_mask_main",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-
-    def set_scale(self, scale: int):
-        assert scale in [0, 1], "Scale must be 0 or 1"
-        if self.current_scale == scale:
-            return
-        self.current_scale = scale
-        self.input_resolution = self.input_resolutions[scale]
-        self.window_size = self.window_size_list[scale]
-        self.window_area = self.window_size[0] * self.window_size[1]
-        self.shift_size = self.shift_size_list[scale]
-        self.attn.set_scale(scale)
-        if hasattr(self, "attn_mask_main"):  # if context scale has been fully added
-            self.attn_mask = (
-                self.attn_mask_main if scale == 0 else self.attn_mask_context
-            )
-
-    def _attn(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-
-        # cyclic shift
-        has_shift = any(self.shift_size)
-        if has_shift:
-            shifted_x = torch.roll(
-                x,
-                shifts=(-self.shift_size[0], -self.shift_size[1]),
-                dims=(1, 2),
-            )
-        else:
-            shifted_x = x
-
-        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
-        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
-        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
-        _, Hp, Wp, _ = shifted_x.shape
-
-        # partition windows
-        x_windows = window_partition(
-            shifted_x, self.window_size
-        )  # B*nW, window_size, window_size, C
-        x_windows = einops.rearrange(
-            x_windows, "BnW nH nW C -> BnW (nH nW) C"
-        )  # B*nW, window_size*window_size, C
-        if self.num_register_tokens > 0:
-            nW = x_windows.shape[0] // B
-            register_token = einops.repeat(register_token, "B R C -> (B nW) R C", nW=nW)
-            x_windows = torch.concat((x_windows, register_token), dim=1)
-            # B*nW, window_size*window_size+R, C
-
-        # W-MSA/SW-MSA
-        if getattr(self, "dynamic_mask", False):
-            attn_mask = self.get_attn_mask(
-                shifted_x, num_register_tokens=self.num_register_tokens
-            )
-        else:
-            if hasattr(self, "scale"):
-                attn_mask = self.attn_mask[self.scale]
-            else:
-                attn_mask = self.attn_mask
-        # Attention step
-        attn_windows = self.attn(
-            x_windows, mask=attn_mask
-        )  # B*nW, window_size*window_size+R, C
-
-        if self.num_register_tokens > 0:
-            register_token = attn_windows[
-                :, -self.num_register_tokens :, :
-            ]  # B*nW, R, C
-            attn_windows = attn_windows[
-                :, : -self.num_register_tokens, :
-            ]  # B*nW, window_size*window_size, C
-        # merge windows
-        attn_windows = einops.rearrange(
-            attn_windows,
-            "BnW (wH wW) C -> BnW wH wW C",
-            wH=self.window_size[0],
-            wW=self.window_size[1],
-        )
-        shifted_x = window_reverse(
-            attn_windows, self.window_size, (Hp, Wp)
-        )  # B H' W' C
-        shifted_x = shifted_x[:, :H, :W, :].contiguous()
-
-        # reverse cyclic shift
-        if has_shift:
-            x = torch.roll(shifted_x, shifts=self.shift_size, dims=(1, 2))
-        else:
-            x = shifted_x
-
-        if self.num_register_tokens > 0:
-            register_token = einops.reduce(
-                register_token, "(B nW) R C -> B R C", reduction="mean", B=B
-            )
-        return x, register_token
-
-    def forward(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-        if register_token is not None:
-            R = register_token.shape[1]
-        else:
-            R = 0
-        assert R == self.num_register_tokens
-
-        x_att, register_token_att = self._attn(x, register_token)
-        # B H W C -> B (HW+R) C
-        if self.num_register_tokens > 0:
-            fused = torch.concat((x.reshape(B, -1, C), register_token), dim=1)
-            fused_att = torch.concat(
-                (x_att.reshape(B, -1, C), register_token_att), dim=1
-            )
-        else:
-            fused = x.reshape(B, -1, C)
-            fused_att = x_att.reshape(B, -1, C)
-
-        fused = fused + self.drop_path1(self.norm1(fused_att))
-        fused = fused + self.drop_path2(self.norm2(self.mlp(fused)))
-        x = fused[:, : H * W, :].reshape(B, H, W, C)
-        if register_token is not None:
-            register_token = fused[:, H * W :, :].reshape(B, R, C)
-
-        return x, register_token
+    return out_dict
 
 
-class PatchMerging(nn.Module):
-    """Patch Merging Layer."""
-
+class Swin_v2_module(nn.Module):
     def __init__(
         self,
-        dim: int,
-        out_dim: Optional[int] = None,
-        norm_layer: nn.Module = nn.LayerNorm,
+        num_classes=4,
+        num_channels=1,
+        segmentation_head=SimpleSegmentationHead,
+        pretrained=False,
+        pretrained_path=None,
+        img_size=512,
+        patch_size=4,
+        window_size=16,
+        embed_dim=96,
+        depths=(2, 2, 18, 2),
+        num_heads=(3, 6, 12, 24),
+        num_register_tokens=0,
+        multi_scale=False,
+        share_patch_embed=False,
     ):
-        """
+        """Initialize the timmNet model.
+
         Args:
-            dim (int): Number of input channels.
-            out_dim (int): Number of output channels (or 2 * dim if None)
-            norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+            backbone (str): Name of the backbone architecture. Default is "vit_base_patch16_384".
+            num_classes (int): Number of output classes. Default is 4.
+            num_channels (int): Number of input channels. Default is 1.
+            pretrained (bool): Whether to use pretrained weights. Default is True.
+            pretrained_path (str): Path to the pretrained weights file. Default is None.
+            img_size (int): Size of the input image. Default is 512.
+            chkpt_path (str): Path to the checkpoint file. Default is None.
         """
         super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim or 2 * dim
-        self.reduction = nn.Linear(4 * dim, self.out_dim, bias=False)
-        self.norm = norm_layer(self.out_dim)
+        self.num_classes = num_classes
+        self.num_channels = num_channels
+        self.pretrained = pretrained
+        self.pretrained_path = pretrained_path
+        self.multi_scale = multi_scale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
+        if isinstance(img_size, Iterable) and not self.multi_scale:
+            self.img_size = img_size[0]
+        else:
+            self.img_size = img_size
 
-        pad_values = (0, 0, 0, W % 2, 0, H % 2)
-        x = nn.functional.pad(x, pad_values)
-        _, H, W, _ = x.shape
+        if self.multi_scale:
+            assert len(img_size) == 2, "Multi-scale requires two image sizes."
+            assert (
+                len(num_channels) == 2
+            ), "Multi-scale requires two channel number (on per scale)"
 
-        x = x.reshape(B, H // 2, 2, W // 2, 2, C).permute(0, 1, 3, 4, 2, 5).flatten(3)
-        x = self.reduction(x)
-        x = self.norm(x)
-        return x
-
-
-class SwinTransformerV2Stage(nn.Module):
-    """A Swin Transformer V2 Stage."""
-
-    def __init__(
-        self,
-        dim: int,
-        out_dim: int,
-        input_resolution: _int_or_tuple_2_t,
-        depth: int,
-        num_heads: int,
-        window_size: _int_or_tuple_2_t,
-        always_partition: bool = False,
-        dynamic_mask: bool = False,
-        downsample: bool = False,
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        proj_drop: float = 0.0,
-        attn_drop: float = 0.0,
-        drop_path: float = 0.0,
-        act_layer: Union[str, Callable] = "gelu",
-        norm_layer: nn.Module = nn.LayerNorm,
-        pretrained_window_size: _int_or_tuple_2_t = 0,
-        output_nchw: bool = False,
-        num_register_tokens: int = 0,
-    ) -> None:
-        """
-        Args:
-            dim: Number of input channels.
-            out_dim: Number of output channels.
-            input_resolution: Input resolution.
-            depth: Number of blocks.
-            num_heads: Number of attention heads.
-            window_size: Local window size.
-            always_partition: Always partition into full windows and shift
-            dynamic_mask: Create attention mask in forward based on current input size
-            downsample: Use downsample layer at start of the block.
-            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
-            qkv_bias: If True, add a learnable bias to query, key, value.
-            proj_drop: Projection dropout rate
-            attn_drop: Attention dropout rate.
-            drop_path: Stochastic depth rate.
-            act_layer: Activation layer type.
-            norm_layer: Normalization layer.
-            pretrained_window_size: Local window size in pretraining.
-            output_nchw: Output tensors on NCHW format instead of NHWC.
-            use_register_token: Whether to use register token
-        """
-        super().__init__()
-        self.dim = dim
-        self.out_dim = out_dim
-        self.input_resolution = input_resolution
-        self.output_resolution = (
-            tuple(i // 2 for i in input_resolution) if downsample else input_resolution
+        self.model = SwinTransformerV2(
+            img_size=self.img_size[0] if self.multi_scale else self.img_size,
+            patch_size=patch_size,
+            in_chans=3,
+            num_classes=1000,  # ignore
+            global_pool="avg",
+            embed_dim=embed_dim,
+            depths=tuple(depths),
+            num_heads=tuple(num_heads),
+            window_size=window_size,
+            always_partition=False,
+            strict_img_size=True,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.0,
+            proj_drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1,
+            act_layer="gelu",
+            norm_layer=nn.LayerNorm,
+            pretrained_window_sizes=(0, 0, 0, 0),
+            num_register_tokens=num_register_tokens,
         )
-        self.depth = depth
-        self.output_nchw = output_nchw
-        self.grad_checkpointing = False
-        window_size = to_2tuple(window_size)
-        shift_size = tuple([w // 2 for w in window_size])
 
-        # patch merging / downsample layer
-        if downsample:
-            self.downsample = PatchMerging(
-                dim=dim, out_dim=out_dim, norm_layer=norm_layer
+        if pretrained:
+            assert pretrained_path is not None, "Pretrained weights path is required."
+            checkpoint = torch.load(pretrained_path)
+            self.model.load_state_dict(
+                checkpoint_filter_fn(checkpoint, self.model), strict=False
             )
-        else:
-            assert dim == out_dim
-            self.downsample = nn.Identity()
 
-        # register token
-        self.use_register_token = num_register_tokens > 0
-        if self.use_register_token and downsample:
-            self.downsample_token = nn.Linear(dim, out_dim)
-
-        # build blocks
-        self.blocks = nn.ModuleList(
-            [
-                SwinTransformerV2Block(
-                    dim=out_dim,
-                    input_resolution=self.output_resolution,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 if (i % 2 == 0) else shift_size,
-                    always_partition=always_partition,
-                    dynamic_mask=dynamic_mask,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    proj_drop=proj_drop,
-                    attn_drop=attn_drop,
-                    drop_path=(
-                        drop_path[i] if isinstance(drop_path, list) else drop_path
-                    ),
-                    act_layer=act_layer,
-                    norm_layer=norm_layer,
-                    pretrained_window_size=pretrained_window_size,
-                    num_register_tokens=num_register_tokens,
-                )
-                for i in range(depth)
-            ]
-        )
-
-    def set_input_size(
-        self,
-        feat_size: Tuple[int, int],
-        window_size: int,
-        always_partition: Optional[bool] = None,
-    ):
-        """Updates the resolution, window size and so the pair-wise relative positions.
-
-        Args:
-            feat_size: New input (feature) resolution
-            window_size: New window size
-            always_partition: Always partition / shift the window
-        """
-        self.input_resolution = feat_size
-        if isinstance(self.downsample, nn.Identity):
-            self.output_resolution = feat_size
-        else:
-            assert isinstance(self.downsample, PatchMerging)
-            self.output_resolution = tuple(i // 2 for i in feat_size)
-        for block in self.blocks:
-            block.set_input_size(
-                feat_size=self.output_resolution,
+        if multi_scale:
+            # use a mlp for fusion
+            reg_token_fusion = None  # default mean
+            self.model.add_context_scale(
+                self.img_size[1],
+                patch_size=patch_size,
                 window_size=window_size,
-                always_partition=always_partition,
+                reg_token_fusion=reg_token_fusion,
+                share_patch_embed=share_patch_embed,
             )
 
-    def add_context_scale(
-        self,
-        feat_size,
-        window_size=None,
-        reg_token_fusion=None,
-        share_patch_embed: Optional[bool] = False,
-    ):
-        """Add a new scale to the model.
+            set_first_layer(
+                self.model.patch_embed[0], num_channels[0]
+            )  # convert to correct number of features
+
+            if not share_patch_embed:
+                set_first_layer(self.model.patch_embed[1], num_channels[1])
+        else:
+            set_first_layer(self.model.patch_embed, num_channels)
+
+        # if use_FPN:
+        #     # Add FPN
+        #     self.model = FPN(self.model, self.num_channels, self.img_size)
+
+        # Measure downsample factor
+        (
+            self.embed_dim,
+            self.downsample_factor,
+            self.feature_size,
+            self.features_format,
+            self.remove_cls_token,
+        ) = infer_output(
+            self.model,
+            self.num_channels,
+            self.img_size,
+            temporal_dim=[0,0],
+            indices=[0],
+        )
+        # Add segmentation head
+        self.seg_head = segmentation_head(
+            self.embed_dim,  # use only one scale at a time scale
+            self.downsample_factor,
+            self.remove_cls_token,
+            self.features_format,
+            self.feature_size,
+            self.num_classes,
+            layer="first",
+        )
+
+    def forward(self, x, metas=None):
+        """Forward pass of the model.
 
         Args:
-            img_size (int or Tuple[int, int]): New image size for the context scale.
-            patch_size (int, optional): Patch size. Defaults to None (uses existing patch size).
-            window_size (int, optional): Window size. Defaults to None.
-            reg_token_fusion (Callable, optional): Function to fuse register tokens from multiple scales. Defaults to None (mean fusion).
-            share_patch_embed (bool, optional): Whether to share patch embedding between scales. Defaults to False.
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            dict: Dictionary containing the output tensor.
         """
-        if window_size is not None and isinstance(window_size, int):
-            window_size = (window_size, window_size)
-        context_window_size, context_shift_size = self._calc_window_shift(
-            to_2tuple(window_size)
-        )
-        self.input_resolutions = [self.input_resolution, feat_size]
-        self.window_size_list = [self.window_size, context_window_size]
-        self.shift_size_list = [self.shift_size, context_shift_size]
-        self.attn.add_context_scale(context_window_size)
+        if (
+            not self.multi_scale
+            and isinstance(x, Iterable)
+            and not isinstance(x, torch.Tensor)
+        ):
+            x = x[0]
 
-        self.set_scale(1)  # switch to context scale
-        self.register_buffer(
-            "attn_mask_context",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
-        self.set_scale(0)  # switch back to main scale
-        self.register_buffer(
-            "attn_mask_main",
-            (
-                None
-                if self.dynamic_mask
-                else self.get_attn_mask(num_register_tokens=self.num_register_tokens)
-            ),
-            persistent=False,
-        )
+        x = self.model.forward_features(x)
 
-    def set_scale(self, scale: int):
-        assert scale in [0, 1], "Scale must be 0 or 1"
-        if self.current_scale == scale:
-            return
-        self.current_scale = scale
-        self.input_resolution = self.input_resolutions[scale]
-        self.window_size = self.window_size_list[scale]
-        self.window_area = self.window_size[0] * self.window_size[1]
-        self.shift_size = self.shift_size_list[scale]
-        self.attn.set_scale(scale)
-        if hasattr(self, "attn_mask_main"):  # if context scale has been fully added
-            self.attn_mask = (
-                self.attn_mask_main if scale == 0 else self.attn_mask_context
-            )
+        if self.multi_scale:
+            x_main, x_cont = x[0], x[1]
+            x_main_pred = self.seg_head(x_main)
+            x_cont_pred = self.seg_head(x_cont)
 
-    def _attn(self, x: torch.Tensor, register_token: torch.Tensor) -> torch.Tensor:
-        B, H, W, C = x.shape
-
-        # cyclic shift
-        has_shift = any(self.shift_size)
-        if has_shift:
-            shifted_x = torch.roll(
-                x,
-                shifts=(-self.shift_size[0], -self.shift_size[1]),
-                dims=(1, 2),
-            )
+            return {
+                "out": x_main_pred,
+                "out_context": x_cont_pred,
+                "embed": x_main,
+                "embed_context": x_cont,
+            }
         else:
-            shifted_x = x
-
-        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
-        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
-        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
-        _, Hp, Wp, _ = shifted_x.shape
-
-        # partition windows
-        x_windows = window_partition(
-            shifted_x, self.window_size
-        )  # B*nW, window_size, window_size, C
-        x_windows = einops.rearrange(
-            x_windows, "BnW nH nW C -> BnW (nH nW) C"
-        )  # B*nW, window_size*window_size, C
-        if self.num_register_tokens > 0:
-            nW = x_windows.shape[0] // B
-            register_token = einops.repeat(register_token, "B R C -> (B nW) R C", nW=nW)
-            x_windows = torch.concat((x_windows, register_token), dim=1)
-            # B*nW, window_size*window_size+R, C
-
-        # W-MSA/SW-MSA
-        if getattr(self, "dynamic_mask", False):
-            attn_mask = self.get_attn_mask(
-                shifted_x, num_register_tokens=self.num_register_tokens
-            )
-        else
+            out = self.seg_head(x[0])
+            return {"out": out, "embed": x[0]}
